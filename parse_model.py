@@ -1,6 +1,5 @@
 import ast
 import os
-import inspect
 from pathlib import Path
 
 SELF_FILE = os.path.basename(__file__)
@@ -8,23 +7,57 @@ SELF_FILE = os.path.basename(__file__)
 def get_py_files_in_dir():
     return [f for f in os.listdir('.') if f.endswith('.py') and f != SELF_FILE]
 
+def resolve_imports(tree):
+    aliases = {}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom):
+            if node.module == 'django.db.models':
+                for alias in node.names:
+                    aliases[alias.asname or alias.name] = f'django.db.models.{alias.name}'
+            elif node.module == 'django.db':
+                for alias in node.names:
+                    if alias.name == 'models':
+                        aliases[alias.asname or alias.name] = 'django.db.models'
+        elif isinstance(node, ast.Import):
+            for alias in node.names:
+                if alias.name == 'django.db.models':
+                    aliases[alias.asname or alias.name] = 'django.db.models'
+    return aliases
+
+def is_model_class(class_node, aliases):
+    for base in class_node.bases:
+        if isinstance(base, ast.Attribute):
+            if isinstance(base.value, ast.Name):
+                base_path = f"{aliases.get(base.value.id, base.value.id)}.{base.attr}"
+                if base_path == 'django.db.models.Model':
+                    return True
+        elif isinstance(base, ast.Name):
+            # handle direct "Model" if it's imported like "from django.db.models import Model"
+            resolved = aliases.get(base.id, '')
+            if resolved == 'django.db.models.Model':
+                return True
+    return False
+
 def parse_model_file(file_path):
     with open(file_path, 'r', encoding='utf-8') as f:
         source = f.read()
-    tree = ast.parse(source, filename=file_path)
 
+    tree = ast.parse(source, filename=file_path)
+    aliases = resolve_imports(tree)
     models = []
+
     for node in ast.walk(tree):
-        if isinstance(node, ast.ClassDef):
-            base_names = [base.id if isinstance(base, ast.Name) else getattr(base.attr, 'id', None) for base in node.bases]
-            if 'Model' in base_names or 'models.Model' in base_names:
-                fields = []
-                for stmt in node.body:
-                    if isinstance(stmt, ast.Assign) and isinstance(stmt.value, ast.Call):
+        if isinstance(node, ast.ClassDef) and is_model_class(node, aliases):
+            fields = []
+            for stmt in node.body:
+                if isinstance(stmt, ast.Assign) and isinstance(stmt.value, ast.Call):
+                    try:
                         field_type = stmt.value.func.attr if isinstance(stmt.value.func, ast.Attribute) else stmt.value.func.id
                         field_name = stmt.targets[0].id
                         fields.append((field_type, field_name))
-                models.append((node.name, fields))
+                    except Exception:
+                        pass
+            models.append((node.name, fields))
     return models
 
 def display_model(model_name, fields):
@@ -35,7 +68,7 @@ def display_model(model_name, fields):
     print(title.center(max_width))
     print(border)
     for typ, name in fields:
-        line = f"*** {typ:<6} {name} ***"
+        line = f"*** {typ:<10} {name} ***"
         print(line.ljust(max_width, '*'))
     print(border + "\n")
 
@@ -60,7 +93,7 @@ def main():
         try:
             models = parse_model_file(file)
             if not models:
-                print("❌ No valid Django models found.\n")
+                print("❌ No valid Django models found in", file, "\n")
                 continue
 
             for model_name, fields in models:
